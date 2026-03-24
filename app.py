@@ -5,28 +5,32 @@ from datetime import datetime, timedelta
 import pandas as pd
 import re
 
-# Configuration ultra-compacte pour mobile
-st.set_page_config(page_title="TCR Dashboard", layout="wide")
+# Configuration
+st.set_page_config(page_title="TCR Dashboard Pro", layout="wide")
 
-# Paramètres fixes (Ton expertise terrain)
-CAPACITES = {'P2': 8, 'P4': 15, 'P5': 20, 'P6': 49, 'P8': 5, 'P19': 10, 'P18': 9}
+# Paramètres du parc
+CAPACITES = {'P2': 8, 'P4': 15, 'P5': 20, 'P6': 49, 'P8': 8, 'P19': 10, 'P18': 9}
 ORDRE = ['P2', 'P4', 'P5', 'P6', 'P8', 'P19', 'P18']
 HISTO_SAT = {'P2':'06:55','P4':'07:18','P5':'07:28','P6':'07:38','P8':'07:51','P19':'07:05','P18':'07:13'}
 
-@st.cache_data(ttl=15)
+@st.cache_data(ttl=20)
 def get_live_data():
     try:
         scraper = cloudscraper.create_scraper()
         res = scraper.get("http://www.smartevlab.fr/", timeout=10)
         soup = BeautifulSoup(res.text, "html.parser")
         data = {}
-        # Mapping IDs Claude
-        mapping = {'P2':1,'P4':3,'P5':4,'P6':5,'P8':6,'P18':11,'P19':12}
-        for p, idx in mapping.items():
-            el = soup.find("div", id=f"count_parking_{idx}")
-            if el:
-                val = re.search(r'\d+', el.get_text())
-                if val: data[p] = int(val.group())
+        
+        cards = soup.find_all("div", class_="card")
+        for card in cards:
+            text = card.get_text(" ", strip=True).upper().replace(" ", "")
+            for p in ORDRE:
+                # Détection hybride (Nom ou Fosse au loup)
+                if p in text or (p == 'P19' and 'FOSSEAULOUP' in text):
+                    count_el = card.find("div", id=re.compile(r'count_parking_'))
+                    if count_el:
+                        val = re.findall(r'\d+', count_el.get_text())
+                        if val: data[p] = int(val[0])
         return data
     except:
         return None
@@ -36,51 +40,63 @@ live_data = get_live_data()
 now = datetime.now()
 is_monday = now.weekday() == 0
 
-# --- 1. ÉTAT ACTUEL (Tableau Conduite) ---
-st.header("🚗 État Actuel & Saturation")
-if not live_data:
-    st.error("⚠️ Direct indisponible (Mode Estimation)")
-    live_data = {p: 0 for p in ORDRE} # Secours
-else:
-    st.success(f"✅ Live OK ({now.strftime('%H:%M')})")
+st.title("🔋 TCR Dashboard - Live & Predict")
 
-summary = []
+# --- 1. TABLEAU DE BORD ---
+st.header("🚗 État des bornes")
+if not live_data:
+    st.error("🔌 Source Smartevlab injoignable. Mode Estimation.")
+    live_data = {p: 0 for p in ORDRE}
+else:
+    st.success(f"✅ Synchronisation OK ({now.strftime('%H:%M')})")
+
+summary_rows = []
 total_libres = 0
 for p in ORDRE:
     dispo = live_data.get(p, 0)
     total_libres += dispo
     h_sat = (datetime.strptime(HISTO_SAT[p], "%H:%M") + timedelta(minutes=-15 if is_monday else 0)).strftime("%H:%M")
-    status = "🔴" if dispo == 0 else ("🟠" if dispo < 3 else "🟢")
-    summary.append({"Parking": p, "État": status, "Libre": f"{dispo}/{CAPACITES[p]}", "Saturation": h_sat})
+    
+    # Statut visuel
+    status = "🟢" if dispo > 3 else ("🟠" if dispo > 0 else "🔴")
+    
+    # Label avec badge de vérification Freshmile
+    if p in ['P2', 'P4', 'P8', 'P18', 'P19']:
+        label = f"{p} ✔️"
+    else:
+        # P5 et P6 n'ont pas encore leurs IDs Freshmile
+        label = f"{p} 🔍" if dispo > 0 else f"{p} ⚠️"
+        
+    summary_rows.append({"Parking": label, "Statut": status, "Places": f"{dispo}/{CAPACITES[p]}", "Saturation": h_sat})
 
-st.table(pd.DataFrame(summary))
+st.table(pd.DataFrame(summary_rows))
 
-# --- 2. GRAPHIQUE AVEC MENU SÉLECTION ---
-st.header("📈 Courbes de Remplissage")
-p_selected = st.selectbox("Sélectionner un parking particulier :", ["Site Global"] + ORDRE)
+# --- 2. ANALYSE ET SÉLECTION ---
+st.divider()
+st.subheader("📈 Courbe de Remplissage")
+p_select = st.selectbox("Sélectionner un parking pour le graphique :", ["Vue Globale"] + ORDRE)
 
-# On simule la courbe Sytadin (Moyenne historique)
-h_axis = [f"{h}h" for h in range(6, 19)]
-base_curves = [5, 25, 75, 95, 100, 100, 95, 80, 85, 98, 90, 60, 30]
+h_axis = [f"{h}h" for h in range(6, 20)]
+hist_vals = [5, 25, 75, 95, 100, 100, 95, 80, 85, 98, 90, 60, 20, 5]
+p_occ_reel = ((sum(CAPACITES.values()) - total_libres) / sum(CAPACITES.values())) * 100
+reel_vals = [v if h < now.hour else (p_occ_reel if h == now.hour else None) for h, v in zip(range(6, 20), hist_vals)]
 
-# Calcul du point réel (en %)
-p_reel_total = ((sum(CAPACITES.values()) - total_libres) / sum(CAPACITES.values())) * 100
-reel_curve = [v if h < now.hour else (p_reel_total if h == now.hour else None) for h, v in zip(range(6, 19), base_curves)]
+st.line_chart(pd.DataFrame({'Historique': hist_vals, 'Réel': reel_vals}, index=h_axis))
 
-st.line_chart(pd.DataFrame({'Historique': base_curves, 'Temps Réel': reel_curve}, index=h_axis))
-
-# --- 3. TABLEAU TEMPS D'ATTENTE (Heure par heure) ---
+# --- 3. MATRICE D'ATTENTE (HEURE PAR HEURE) ---
+st.divider()
 st.header("⏳ Temps d'attente estimé (min)")
-# Matrice simplifiée selon le type de parking
-wait_rows = []
+wait_matrix = []
 for p in ORDRE:
-    # Profil 'lent' (P2, P18, P19) vs 'dynamique' (P5, P6)
-    wait_profile = [10, 40, 80, 120, 180, 180, 150, 100, 60, 40, 15] if p in ['P2','P18','P19'] else [5, 15, 30, 45, 30, 15, 10, 20, 25, 15, 5]
+    # Profil P4, P5, P6 (Turnover plus élevé) vs P2, P18, P19 (Sédentaires)
+    if p in ['P4', 'P5', 'P6']:
+        profile = [5, 15, 30, 45, 30, 15, 10, 20, 25, 15, 5]
+    else:
+        profile = [15, 45, 90, 120, 180, 180, 150, 100, 60, 40, 20]
+    
     row = {"Parking": p}
     for i, h in enumerate(range(7, 18)):
-        row[f"{h}h"] = wait_profile[i]
-    wait_rows.append(row)
+        row[f"{h}h"] = profile[i]
+    wait_matrix.append(row)
 
-st.dataframe(pd.DataFrame(wait_rows).set_index("Parking"))
-
-st.info("💡 Astuce : Entre 12h15 et 12h45, le P6 a le turnover le plus élevé.")
+st.dataframe(pd.DataFrame(wait_matrix).set_index("Parking").style.background_gradient(cmap='RdYlGn_r', axis=None))
