@@ -5,106 +5,85 @@ from datetime import datetime, timedelta
 import pandas as pd
 import re
 
-# Configuration
-st.set_page_config(page_title="TCR Bornes Predict", page_icon="🔋", layout="wide")
+# Config
+st.set_page_config(page_title="TCR Dashboard", layout="wide")
 
+# Data Statique
 CAPACITES = {'P2': 8, 'P4': 15, 'P5': 20, 'P6': 49, 'P8': 5, 'P19': 10, 'P18': 9}
-HISTO_SAT = {'P2': '06:55', 'P4': '07:18', 'P5': '07:28', 'P6': '07:38', 'P8': '07:51', 'P19': '07:05', 'P18': '07:13'}
-DEPART_MIDI = {'P4': '11:50', 'P5': '12:37', 'P6': '11:38', 'P8': '11:34'}
 ORDRE = ['P2', 'P4', 'P5', 'P6', 'P8', 'P19', 'P18']
+HISTO_SAT = {'P2':'06:55','P4':'07:18','P5':'07:28','P6':'07:38','P8':'07:51','P19':'07:05','P18':'07:13'}
 
-@st.cache_data(ttl=30)
-def get_live_data():
-    # Tentative 1 : Direct
-    # Tentative 2 : Via Proxy si la 1 échoue
+def fetch_data():
+    # On essaie 3 sources différentes
     urls = [
         "http://www.smartevlab.fr/",
-        "https://api.allorigins.win/get?url=" + requests.utils.quote("http://www.smartevlab.fr/")
+        "https://api.allorigins.win/get?url=" + requests.utils.quote("http://www.smartevlab.fr/"),
+        "https://thingproxy.freeboard.io/fetch/http://www.smartevlab.fr/"
     ]
     
     for url in urls:
         try:
-            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0'}
-            response = requests.get(url, headers=headers, timeout=12)
-            
-            # Si on passe par AllOrigins, le HTML est dans le champ 'contents'
-            if "allorigins" in url:
-                html = response.json().get('contents', '')
-            else:
-                html = response.text
+            res = requests.get(url, timeout=10, headers={'User-Agent': 'Mozilla/5.0'})
+            if res.status_code == 200:
+                # Si proxy AllOrigins, on extrait le JSON
+                content = res.json()['contents'] if "allorigins" in url else res.text
+                soup = BeautifulSoup(content, "html.parser")
                 
-            soup = BeautifulSoup(html, "html.parser")
-            data_found = {}
-            
-            # Analyse des cartes
-            cards = soup.find_all("div", class_="card")
-            for card in cards:
-                txt = card.get_text(" ", strip=True).upper().replace(" ", "")
-                for p in ORDRE:
-                    if p in txt:
-                        # On cherche l'ID de compteur count_parking_X
-                        c_div = card.find("div", id=lambda x: x and 'count_parking_' in x)
-                        if c_div:
-                            n = re.findall(r'\d+', c_div.get_text())
-                            if n: data_found[p] = int(n[0])
-            
-            if data_found: return data_found
+                # Extraction ultra-directe par les IDs de Claude
+                results = {}
+                mapping = {'P2':1,'P4':3,'P5':4,'P6':5,'P8':6,'P18':11,'P19':12}
+                for p, idx in mapping.items():
+                    el = soup.find("div", id=f"count_parking_{idx}")
+                    if el:
+                        val = re.findall(r'\d+', el.get_text())
+                        results[p] = int(val[0]) if val else 0
+                
+                if results: return results
         except:
             continue
     return None
 
-# --- AFFICHAGE ---
-live_raw = get_live_data()
-data_live = live_raw if live_raw else {p: 0 for p in ORDRE}
+# --- UI ---
+st.title("🔋 TCR Bornes Predict")
+if st.button('🔄 Forcer la mise à jour'):
+    st.cache_data.clear()
+
+data_live = fetch_data()
 now = datetime.now()
 is_monday = now.weekday() == 0
-is_rainy = st.sidebar.checkbox("Pluie 🌧️", value=False)
+is_rainy = st.sidebar.checkbox("Pluie 🌧️")
 
-st.title("🔋 TCR Bornes Predict")
-
-if not live_raw:
-    st.error("⚠️ Site Smartevlab inaccessible (Même via Proxy). Vérifie si le site fonctionne sur ton navigateur.")
+# 1. TABLEAU PRINCIPAL
+st.header("🚗 État & Saturation")
+if not data_live:
+    st.error("❌ Site Smartevlab injoignable. Vérifiez votre connexion ou le site source.")
+    data_live = {p: 0 for p in ORDRE}
 else:
-    st.success(f"✅ Connecté à {now.strftime('%H:%M')}")
+    st.success(f"✅ Mis à jour à {now.strftime('%H:%M:%S')}")
 
-# Tableau "Conduite"
-summary = []
-total_dispo = 0
+rows = []
 for p in ORDRE:
     dispo = data_live.get(p, 0)
-    total_dispo += dispo
     h_theo = datetime.strptime(HISTO_SAT[p], "%H:%M")
-    recalage = -15 if (now.hour < 8 and dispo == 0 and p not in ['P2', 'P18']) else 0
-    h_prev = (h_theo + timedelta(minutes=recalage + (-15 if is_monday else 0))).strftime("%H:%M")
-    status = "🔴" if dispo == 0 else ("🟠" if dispo < 3 else "🟢")
-    summary.append({"Parking": p, "Statut": status, "Libre": f"{dispo}/{CAPACITES[p]}", "Saturation": h_prev})
+    recalage = -15 if (is_monday) else 0
+    h_sat = (h_theo + timedelta(minutes=recalage)).strftime("%H:%M")
+    
+    status = "🟢" if dispo > 2 else ("🟠" if dispo > 0 else "🔴")
+    rows.append({"Parking": p, "Statut": status, "Places": f"{dispo}/{CAPACITES[p]}", "Saturation": h_sat})
 
-st.table(pd.DataFrame(summary))
+st.table(pd.DataFrame(rows))
 
-# Graphique
-st.header("📈 Remplissage (%)")
-heures = [f"{h:02d}:00" for h in range(6, 21)]
-base = [5, 25, 75, 95, 100, 98, 92, 85, 90, 98, 85, 60, 30, 15, 5]
-prev = [min(100, v + (10 if is_monday or is_rainy else 0)) for v in base]
-p_reel = ((sum(CAPACITES.values()) - total_dispo) / sum(CAPACITES.values())) * 100 if live_raw else None
-reel = [v + 1 if h < now.hour else (p_reel if (h == now.hour and live_raw) else None) for h, v in zip(range(6, 21), prev)]
-st.line_chart(pd.DataFrame({'Heure': heures, 'Moyenne': base, 'Prévue': prev, 'Réel': reel}).set_index('Heure'))
+# 2. GRAPHIQUE
+st.header("📈 Remplissage global")
+base = [5, 25, 75, 95, 100, 98, 92, 85, 90, 98, 85, 60, 30]
+# Calcul du point réel si data dispo
+total_dispo = sum(data_live.values())
+p_reel = ((sum(CAPACITES.values()) - total_dispo) / sum(CAPACITES.values())) * 100
+reel = [v if h < now.hour else (p_reel if h == now.hour else None) for h, v in zip(range(6, 19), base)]
+st.line_chart(pd.DataFrame({'Moyenne': base, 'Réel': reel}, index=[f"{h}h" for h in range(6, 19)]))
 
-# Midi
+# 3. MIDI
 st.header("🕒 Recharger le midi")
-midi_list = []
-for p in ORDRE:
-    h_base = DEPART_MIDI.get(p, "N/A")
-    if h_base != "N/A":
-        h_dt = datetime.strptime(h_base, "%H:%M")
-        if is_rainy: h_dt += timedelta(minutes=10)
-        h_fin = h_dt.strftime("%H:%M")
-        att = "Env. 8 min"
-    else: h_fin, att = "Déconseillé", "> 45 min"
-    midi_list.append({"Parking": p, "Départ": h_fin, "Attente": att})
-st.table(pd.DataFrame(midi_list))
-
-# Attente
-st.header("⏳ Attente estimée (min)")
-wait_data = {p: ([40, 90, 150, 180, 180, 160, 140, 120, 100, 60] if p in ['P2', 'P18', 'P19'] else ([10, 25, 45, 30, 15, 10, 15, 20, 15, 10] if p == 'P5' else [20, 45, 80, 110, 100, 70, 60, 50, 40, 25])) for p in ORDRE}
-st.dataframe(pd.DataFrame(wait_data, index=[f"{h}h" for h in range(7, 17)]).T)
+st.write("Départ conseillé pour <10min d'attente :")
+midi = {"P4":"11:50","P5":"12:37","P6":"11:38","P8":"11:34"}
+st.table(pd.DataFrame([{"Parking":k, "Départ":v} for k,v in midi.items()]))
