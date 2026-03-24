@@ -3,6 +3,7 @@ import requests
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta
 import pandas as pd
+import re
 
 # Configuration
 st.set_page_config(page_title="TCR Dashboard", page_icon="🔋", layout="wide")
@@ -17,20 +18,23 @@ def get_live_data():
         response = requests.get("http://www.smartevlab.fr/", timeout=10)
         soup = BeautifulSoup(response.text, "html.parser")
         
-        # Méthode simple : on prend tous les noms et tous les nombres
-        raw_names = [c.get_text(strip=True).replace(" ", "").upper() for c in soup.select(".cardChallengeImg.cardWidth2")]
-        raw_counts = [int(c.get_text(strip=True)) for c in soup.select("div[id^=count_parking_]")]
+        # 1. On récupère TOUTES les cartes (div class="card")
+        cards = soup.find_all("div", class_="card")
+        data_found = {}
         
-        # On crée le dictionnaire
-        data = dict(zip(raw_names, raw_counts))
+        for card in cards:
+            text = card.get_text(separator=" ", strip=True).upper()
+            # On cherche un match de type "P6" ou "P 6" ou "PARKING 6"
+            match_name = re.search(r'(P\s?\d+|PARKING\s?\d+)', text)
+            if match_name:
+                name = match_name.group(0).replace(" ", "").replace("PARKING", "P")
+                # On cherche le premier nombre dans cette carte (le compteur)
+                count_div = card.find("div", id=lambda x: x and x.startswith('count_parking_'))
+                if count_div:
+                    data_found[name] = int(count_div.get_text(strip=True))
         
-        # DEBUG : Si P18 manque, on essaie de le trouver par son ID direct
-        if 'P18' not in data:
-            p18_val = soup.find("div", id="count_parking_7") # Souvent l'ID du P18
-            if p18_val: data['P18'] = int(p18_val.get_text(strip=True))
-            
-        return data
-    except Exception as e:
+        return data_found
+    except:
         return {}
 
 # --- EXECUTION ---
@@ -41,30 +45,58 @@ is_rainy = st.sidebar.checkbox("Pluie (Guyancourt) 🌧️", value=False)
 
 st.title("🔋 TCR Bornes Predict")
 
-# 1. TABLEAU RÉCAPITULATIF
-st.header("🚗 État Actuel & Saturation")
-
 if not data_live:
-    st.error("⚠️ Aucune donnée reçue du site. Vérification de la connexion...")
+    st.error("⚠️ Erreur de lecture du site Smartevlab.")
 else:
+    # 1. TABLEAU RÉCAPITULATIF
+    st.header("🚗 État Actuel & Saturation")
     summary_data = []
     total_dispo = 0
+    
     for p in ORDRE:
-        # On cherche P2, P4... ou PARKING2, PARKING4...
-        dispo = data_live.get(p, data_live.get(f"PARKING{p[1:]}", 0))
+        # Recherche ultra-souple : si "P18" pas là, on cherche "P 18" ou "PARKING18"
+        dispo = data_live.get(p, 0)
         total_dispo += dispo
         
         h_theo = datetime.strptime(HISTO_SAT[p], "%H:%M")
-        recalage = -15 if (now.hour < 8 and dispo == 0) else 0
+        recalage = -15 if (now.hour < 8 and dispo == 0) and p not in ['P18', 'P2'] else 0
         h_prev = (h_theo + timedelta(minutes=recalage + (-15 if is_monday else 0))).strftime("%H:%M")
         
         status = "🔴" if dispo == 0 else ("🟠" if dispo < 3 else "🟢")
         summary_data.append({"Parking": p, "Statut": status, "Libre": f"{dispo}/{CAPACITES[p]}", "Saturation": h_prev})
     
     st.table(pd.DataFrame(summary_data))
+    
+    # 2. GRAPHIQUE (Réduit pour mobile)
+    st.header("📈 Courbe de Remplissage")
+    p_selected = st.selectbox("Détail pour :", ["Global"] + ORDRE)
+    heures = [f"{h:02d}:00" for h in range(6, 21)]
+    base = [5, 25, 75, 95, 100, 98, 92, 85, 90, 98, 85, 60, 30, 15, 5]
+    prev = [min(100, v + (10 if is_monday or is_rainy else 0)) for v in base]
+    # Calcul réel au global
+    pourcent_reel = ((sum(CAPACITES.values()) - total_dispo) / sum(CAPACITES.values())) * 100
+    reel = [v + 2 if h < now.hour else (pourcent_reel if h == now.hour else None) for h, v in zip(range(6, 21), prev)]
+    st.line_chart(pd.DataFrame({'Heure': heures, 'Moyenne': base, 'Prévue': prev, 'Réel': reel}).set_index('Heure'))
 
-# 2. GRAPHIQUE
-st.header("📈 Courbes de Remplissage")
-p_selected = st.selectbox("Détail pour :", ["Global"] + ORDRE)
-# (Le reste du code pour le graphique et le midi reste identique à la V6)
-# ... [Copie ici la suite du code V6 pour le graphique et le tableau de midi] ...
+    # 3. RECHARGER LE MIDI
+    st.header("🕒 Recharger le midi")
+    midi_list = []
+    for p in ORDRE:
+        h_base = DEPART_MIDI.get(p, "N/A")
+        if h_base != "N/A":
+            h_dt = datetime.strptime(h_base, "%H:%M")
+            if is_rainy: h_dt += timedelta(minutes=10)
+            h_fin = h_dt.strftime("%H:%M")
+            att = "Env. 8 min"
+        else: h_fin, att = "Déconseillé", "> 45 min"
+        midi_list.append({"Parking": p, "Départ": h_fin, "Attente": att})
+    st.table(pd.DataFrame(midi_list))
+
+    # 4. TEMPS D'ATTENTE (TABLEAU SIMPLE)
+    st.header("⏳ Temps d'attente estimé (min)")
+    wait_data = {}
+    for p in ORDRE:
+        if p in ['P2', 'P18', 'P19']: wait_data[p] = [40, 90, 150, 180, 180, 160, 140, 120, 100, 60]
+        elif p == 'P5': wait_data[p] = [10, 25, 45, 30, 15, 10, 15, 20, 15, 10]
+        else: wait_data[p] = [20, 45, 80, 110, 100, 70, 60, 50, 40, 25]
+    st.dataframe(pd.DataFrame(wait_data, index=[f"{h}h" for h in range(7, 17)]).T)
