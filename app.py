@@ -4,72 +4,81 @@ from bs4 import BeautifulSoup
 from datetime import datetime, timedelta
 import pandas as pd
 import re
-import urllib3
 
-# Désactive les avertissements de sécurité dans la console
+# Désactivation totale des alertes de sécurité
+import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# Config
-st.set_page_config(page_title="TCR Dashboard", layout="wide")
+st.set_page_config(page_title="TCR Bornes Predict", layout="wide")
 
 CAPACITES = {'P2': 8, 'P4': 15, 'P5': 20, 'P6': 49, 'P8': 5, 'P19': 10, 'P18': 9}
 ORDRE = ['P2', 'P4', 'P5', 'P6', 'P8', 'P19', 'P18']
 HISTO_SAT = {'P2':'06:55','P4':'07:18','P5':'07:28','P6':'07:38','P8':'07:51','P19':'07:05','P18':'07:13'}
 
-@st.cache_data(ttl=20)
-def fetch_live_data():
+@st.cache_data(ttl=30)
+def fetch_data():
+    # Utilisation du HTTP simple pour contourner le SSL foireux
     url = "http://www.smartevlab.fr/"
     try:
-        # verify=False permet d'ignorer l'erreur de certificat SSL
-        res = requests.get(url, timeout=15, verify=False, headers={'User-Agent': 'Mozilla/5.0'})
-        soup = BeautifulSoup(res.text, "html.parser")
-        
-        final_results = {}
-        cards = soup.find_all("div", class_="card")
-        
-        for card in cards:
-            text = card.get_text(" ", strip=True).upper().replace(" ", "")
-            for p_name in ORDRE:
-                if p_name in text:
-                    count_el = card.find("div", id=re.compile(r'count_parking_'))
-                    if count_el:
-                        val = re.findall(r'\d+', count_el.get_text())
-                        if val: final_results[p_name] = int(val[0])
-        return final_results
-    except Exception as e:
-        print(f"Erreur : {e}")
-        return None
+        # Timeout court pour ne pas bloquer l'appli
+        res = requests.get(url, timeout=8, verify=False, headers={'User-Agent': 'Mozilla/5.0'})
+        if res.status_code == 200:
+            soup = BeautifulSoup(res.text, "html.parser")
+            results = {}
+            cards = soup.find_all("div", class_="card")
+            for card in cards:
+                txt = card.get_text(" ", strip=True).upper().replace(" ", "")
+                for p in ORDRE:
+                    if p in txt:
+                        c_el = card.find("div", id=re.compile(r'count_parking_'))
+                        if c_el:
+                            n = re.findall(r'\d+', c_el.get_text())
+                            if n: results[p] = int(n[0])
+            if results: return results
+    except:
+        pass
+    return None
 
-# --- UI ---
-st.title("🔋 TCR Bornes Predict")
-if st.button('🔄 Forcer la mise à jour'):
-    st.cache_data.clear()
-
-live_data = fetch_live_data()
+# --- LOGIQUE ---
+raw_live = fetch_data()
 now = datetime.now()
 is_monday = now.weekday() == 0
-is_rainy = st.sidebar.checkbox("Pluie 🌧️")
 
-# 1. ÉTAT ACTUEL
-st.header("🚗 État & Saturation")
-if not live_data:
-    st.error("⚠️ Le site source a un problème de sécurité (SSL). Tentative de lecture sécurisée en cours...")
-    live_data = {p: 0 for p in ORDRE}
+# Système de secours si le site est bloqué
+if not raw_live:
+    st.error("🔌 Site source inaccessible (SSL/Timeout). Passage en mode 'Estimation historique'.")
+    # On simule des données crédibles : le matin c'est plein, le midi ça se libère un peu
+    hour = now.hour
+    if hour < 7: data_live = {p: CAPACITES[p] for p in ORDRE}
+    elif hour < 12: data_live = {p: 0 for p in ORDRE}
+    elif hour < 14: data_live = {'P2':0, 'P4':2, 'P5':5, 'P6':12, 'P8':1, 'P19':0, 'P18':1}
+    else: data_live = {p: 0 for p in ORDRE}
 else:
-    st.success(f"✅ Données en direct ({now.strftime('%H:%M')})")
+    data_live = raw_live
+    st.success(f"✅ Live OK ({now.strftime('%H:%M')})")
 
-rows = []
-total_libres = 0
+# --- UI TABLEAU ---
+st.header("🚗 État & Saturation")
+summary = []
 for p in ORDRE:
-    dispo = live_data.get(p, 0)
-    total_libres += dispo
+    dispo = data_live.get(p, 0)
     h_theo = datetime.strptime(HISTO_SAT[p], "%H:%M")
-    recalage = -15 if (is_monday) else 0
-    h_sat = (h_theo + timedelta(minutes=recalage)).strftime("%H:%M")
+    h_sat = (h_theo + timedelta(minutes=-15 if is_monday else 0)).strftime("%H:%M")
     status = "🟢" if dispo > 2 else ("🟠" if dispo > 0 else "🔴")
-    rows.append({"Parking": p, "Statut": status, "Places": f"{dispo}/{CAPACITES[p]}", "Saturation": h_sat})
+    summary.append({"Parking": p, "Statut": status, "Places": f"{dispo}/{CAPACITES[p]}", "Saturation": h_sat})
 
-st.table(pd.DataFrame(rows))
-st.write(f"**Disponibilité totale : {total_libres} bornes.**")
+st.table(pd.DataFrame(summary))
 
-# (Garder le reste du code pour le graphique et le midi identique à la V18)
+# --- GRAPHIQUE ---
+st.header("📈 Remplissage (%)")
+base_curves = [5, 25, 75, 95, 100, 98, 92, 85, 90, 98, 85, 60, 30]
+total_libres = sum(data_live.values())
+p_reel = ((sum(CAPACITES.values()) - total_libres) / sum(CAPACITES.values())) * 100
+reel_curve = [v if h < now.hour else (p_reel if h == now.hour else None) for h, v in zip(range(6, 19), base_curves)]
+st.line_chart(pd.DataFrame({'Moyenne': base_curves, 'Réel': reel_curve}, index=[f"{h}h" for h in range(6, 19)]))
+
+# --- ATTENTE ---
+st.header("⏳ Temps d'attente (min)")
+wait_data = {p: [40, 90, 150, 180, 180, 160, 140, 120, 100, 60] for p in ORDRE}
+# On affiche un tableau condensé pour la conduite
+st.dataframe(pd.DataFrame(wait_data, index=[f"{h}h" for h in range(7, 17)]).T)
