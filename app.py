@@ -3,14 +3,16 @@ import requests
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta
 import pandas as pd
+import numpy as np
 
 # Configuration
-st.set_page_config(page_title="TCR Bornes Predict", page_icon="🔋", layout="wide")
+st.set_page_config(page_title="TCR Dashboard", page_icon="🔋", layout="wide")
 
 # Paramètres du parc
 CAPACITES = {'P2': 8, 'P4': 15, 'P5': 20, 'P6': 49, 'P8': 5, 'P19': 10, 'P18': 9}
 HISTO_SAT = {'P2': '06:55', 'P4': '07:18', 'P5': '07:28', 'P6': '07:38', 'P8': '07:51', 'P19': '07:05', 'P18': '07:13'}
-DEPART_MIDI = {'P2': 'N/A', 'P4': '11:50', 'P5': '12:37', 'P6': '11:38', 'P8': '11:34', 'P19': 'N/A', 'P18': 'N/A'}
+DEPART_MIDI = {'P4': '11:50', 'P5': '12:37', 'P6': '11:38', 'P8': '11:34'}
+ORDRE = ['P2', 'P4', 'P5', 'P6', 'P8', 'P19', 'P18']
 
 def get_live_data():
     try:
@@ -21,89 +23,75 @@ def get_live_data():
         return dict(zip(codes, compteurs))
     except: return None
 
-# --- ANALYSE ---
-st.title("🔋 TCR Bornes Predict")
 data_live = get_live_data()
 now = datetime.now()
+is_monday = now.weekday() == 0
+is_rainy = st.sidebar.checkbox("Pluie (Guyancourt) 🌧️", value=False)
 
-# 1. ÉTAT RÉEL ET PRÉVISIONS DE SATURATION
-st.header("📊 État Actuel & Prévisions")
+# --- 1. TABLEAU RÉCAPITULATIF "CONDUITE" ---
+st.header("🚗 État Actuel & Saturation")
+recalage = 0
 if data_live:
-    cols = st.columns(len(CAPACITES))
-    ordre = ['P2', 'P4', 'P5', 'P6', 'P8', 'P19', 'P18']
-    
-    # Calcul du recalage temps réel
-    is_monday = now.weekday() == 0
-    is_rainy = st.sidebar.checkbox("Pluie à Guyancourt 🌧️", value=False)
-    
-    # Recalage simplifié
-    total_dispo = sum(data_live.get(p, 0) for p in ordre)
+    total_dispo = sum(data_live.get(p, 0) for p in ORDRE)
     total_cap = sum(CAPACITES.values())
-    recalage = -15 if (now.hour < 8 and (total_dispo/total_cap) < 0.3) else 0
+    if now.hour < 8 and (total_dispo/total_cap) < 0.4: recalage = -15
 
-    for i, p in enumerate(ordre):
+    summary_data = []
+    for p in ORDRE:
         dispo = data_live.get(p, 0)
         cap = CAPACITES[p]
         h_theo = datetime.strptime(HISTO_SAT[p], "%H:%M")
         h_prev = (h_theo + timedelta(minutes=recalage + (-15 if is_monday else 0))).strftime("%H:%M")
         
-        with cols[i]:
-            st.metric(label=f"Borne {p}", value=f"{dispo}/{cap}", delta=f"Sat: {h_prev}", delta_color="inverse")
-            st.progress(dispo / cap)
+        # Icône de statut rapide
+        status = "🔴 PLEIN" if dispo == 0 else ("🟠" if dispo < 3 else "🟢")
+        summary_data.append({
+            "Parking": p,
+            "État": status,
+            "Places": f"{dispo} / {cap}",
+            "Saturation Prévue": h_prev
+        })
+    st.table(pd.DataFrame(summary_data))
 else:
-    st.error("Serveur Smartevlab injoignable.")
+    st.error("Données indisponibles.")
 
-# 2. GRAPHIQUE DE REMPLISSAGE (%) - TYPE SYTADIN
-st.header("📈 Courbes de Remplissage du Parc (%)")
+# --- 2. GRAPHIQUE SYTADIN & FILTRE ---
+st.header("📈 Courbes de Remplissage")
+p_selected = st.selectbox("Sélectionner un parking pour le détail :", ["Global"] + ORDRE)
+
 heures = [f"{h:02d}:00" for h in range(6, 21)]
+base_remplissage = [5, 25, 75, 95, 100, 98, 92, 85, 90, 98, 85, 60, 30, 15, 5]
+prevue = [min(100, v + (10 if is_monday or is_rainy else 0)) for v in base_remplissage]
+reel = [v + 2 if h < now.hour else ((((total_cap - total_dispo)/total_cap)*100) if h == now.hour else None) for h, v in zip(range(6, 21), prevue)]
 
-# Simulation des courbes
-base_remplissage = [5, 25, 75, 95, 100, 98, 92, 85, 90, 98, 85, 60, 30, 15, 5] # Moyenne
-prevue = [min(100, v + (10 if is_monday or is_rainy else 0)) for v in base_remplissage] # Prévue (Météo/Jour)
-
-# Courbe Temps Réel (s'arrête à l'heure actuelle)
-current_hour = now.hour
-reel = []
-for i, h in enumerate(range(6, 21)):
-    if h < current_hour:
-        reel.append(prevue[i] + 2) # Historique de la journée
-    elif h == current_hour:
-        reel.append(((total_cap - total_dispo) / total_cap) * 100) # Point actuel exact
-    else:
-        reel.append(None) # Futur
-
-df_graph = pd.DataFrame({
-    'Heure': heures,
-    'Moyenne habituelle': base_remplissage,
-    'Prévue (Jour + Météo)': prevue,
-    'Temps Réel': reel
-}).set_index('Heure')
-
+df_graph = pd.DataFrame({'Heure': heures, 'Moyenne': base_remplissage, 'Prévue': prevue, 'Temps Réel': reel}).set_index('Heure')
 st.line_chart(df_graph)
 
-
-# 3. RECHARGER LE MIDI
+# --- 3. RECHARGER LE MIDI ---
 st.header("🕒 Recharger le midi")
-st.subheader("Heure de départ conseillée pour limiter l'attente")
-
-midi_data = []
-for p in ['P2', 'P4', 'P5', 'P6', 'P8', 'P19', 'P18']:
+st.write("Heure de départ conseillée (limiter l'attente)")
+midi_list = []
+for p in ORDRE:
     h_base = DEPART_MIDI.get(p, "N/A")
     if h_base != "N/A":
         h_dt = datetime.strptime(h_base, "%H:%M")
         if is_rainy: h_dt += timedelta(minutes=10)
-        heure_finale = h_dt.strftime("%H:%M")
+        h_fin = h_dt.strftime("%H:%M")
         attente = "Env. 8 min"
-    else:
-        heure_finale = "Déconseillé"
-        attente = "> 45 min"
-        
-    midi_data.append({
-        "Parking": p, 
-        "Départ conseillé (10m marche)": heure_finale, 
-        "Attente estimée à l'arrivée": attente
-    })
+    else: h_fin, attente = "Déconseillé", "> 45 min"
+    midi_list.append({"Parking": p, "Départ (10m marche)": h_fin, "Attente estimée": attente})
+st.table(pd.DataFrame(midi_list))
 
-st.table(pd.DataFrame(midi_data))
+# --- 4. TABLEAU TEMPS D'ATTENTE HEURE PAR HEURE ---
+st.header("⏳ Temps d'attente estimé (min)")
+heures_wait = [f"{h:02d}h" for h in range(7, 18)]
+wait_data = {}
+for p in ORDRE:
+    # Simulation basée sur tes calculs de turnover : P5 fluide, P2 ventouse
+    if p in ['P2', 'P18', 'P19']: base_w = [40, 90, 150, 180, 180, 160, 140, 120, 100, 60, 30]
+    elif p == 'P5': base_w = [10, 25, 45, 30, 15, 10, 15, 20, 15, 10, 5]
+    else: base_w = [20, 45, 80, 110, 100, 70, 60, 50, 40, 25, 10]
+    wait_data[p] = base_w
 
-st.sidebar.info(f"Dernier check : {now.strftime('%H:%M:%S')}")
+df_wait = pd.DataFrame(wait_data, index=heures_wait).T
+st.dataframe(df_wait.style.background_gradient(cmap='YlOrRd', axis=None))
