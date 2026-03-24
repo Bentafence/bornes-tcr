@@ -5,93 +5,82 @@ from datetime import datetime, timedelta
 import pandas as pd
 import re
 
-# Configuration
-st.set_page_config(page_title="TCR RealTime", layout="wide")
+# Configuration ultra-compacte pour mobile
+st.set_page_config(page_title="TCR Dashboard", layout="wide")
 
+# Paramètres fixes (Ton expertise terrain)
 CAPACITES = {'P2': 8, 'P4': 15, 'P5': 20, 'P6': 49, 'P8': 5, 'P19': 10, 'P18': 9}
 ORDRE = ['P2', 'P4', 'P5', 'P6', 'P8', 'P19', 'P18']
 HISTO_SAT = {'P2':'06:55','P4':'07:18','P5':'07:28','P6':'07:38','P8':'07:51','P19':'07:05','P18':'07:13'}
 
-# --- MOTEUR DE RÉCUPÉRATION ROBUSTE ---
 @st.cache_data(ttl=15)
 def get_live_data():
     try:
-        # cloudscraper imite un navigateur pour éviter le blocage IP
         scraper = cloudscraper.create_scraper()
-        response = scraper.get("http://www.smartevlab.fr/", timeout=15)
-        soup = BeautifulSoup(response.text, "html.parser")
-        
-        data_found = {}
-        # On scanne les cartes par ID fixe (méthode la plus rapide)
+        res = scraper.get("http://www.smartevlab.fr/", timeout=10)
+        soup = BeautifulSoup(res.text, "html.parser")
+        data = {}
+        # Mapping IDs Claude
         mapping = {'P2':1,'P4':3,'P5':4,'P6':5,'P8':6,'P18':11,'P19':12}
-        
-        for p_name, p_id in mapping.items():
-            element = soup.find("div", id=f"count_parking_{p_id}")
-            if element:
-                # Extraction propre du chiffre uniquement
-                val = re.search(r'\d+', element.get_text())
-                if val:
-                    data_found[p_name] = int(val.group())
-        
-        return data_found
-    except Exception as e:
+        for p, idx in mapping.items():
+            el = soup.find("div", id=f"count_parking_{idx}")
+            if el:
+                val = re.search(r'\d+', el.get_text())
+                if val: data[p] = int(val.group())
+        return data
+    except:
         return None
 
-# --- LOGIQUE D'AFFICHAGE ---
+# --- LOGIQUE ---
 live_data = get_live_data()
 now = datetime.now()
 is_monday = now.weekday() == 0
 
-st.title("🔌 TCR Live - Temps Réel")
-
-# 1. TABLEAU DE BORD (Priorité Conduite)
+# --- 1. ÉTAT ACTUEL (Tableau Conduite) ---
+st.header("🚗 État Actuel & Saturation")
 if not live_data:
-    st.error("❌ Échec de synchronisation. Tentative de reconnexion automatique...")
-    if st.button("Réessayer maintenant"):
-        st.cache_data.clear()
-        st.rerun()
-    live_data = {p: 0 for p in ORDRE} # Évite le crash
+    st.error("⚠️ Direct indisponible (Mode Estimation)")
+    live_data = {p: 0 for p in ORDRE} # Secours
 else:
-    st.success(f"✅ Données Live Synchronisées - {now.strftime('%H:%M:%S')}")
+    st.success(f"✅ Live OK ({now.strftime('%H:%M')})")
 
-# Tableau compact
 summary = []
 total_libres = 0
 for p in ORDRE:
     dispo = live_data.get(p, 0)
     total_libres += dispo
     h_sat = (datetime.strptime(HISTO_SAT[p], "%H:%M") + timedelta(minutes=-15 if is_monday else 0)).strftime("%H:%M")
-    status = "🟢" if dispo > 3 else ("🟠" if dispo > 0 else "🔴")
-    summary.append({"Parking": p, "État": status, "Dispo": f"{dispo}/{CAPACITES[p]}", "Saturation": h_sat})
+    status = "🔴" if dispo == 0 else ("🟠" if dispo < 3 else "🟢")
+    summary.append({"Parking": p, "État": status, "Libre": f"{dispo}/{CAPACITES[p]}", "Saturation": h_sat})
 
 st.table(pd.DataFrame(summary))
 
-# 2. MENU SÉLECTION & GRAPHIQUE PRÉDICTIF
-st.header("📈 Graphique de remplissage")
-target_p = st.selectbox("Sélectionner un parking :", ["Site Global"] + ORDRE)
+# --- 2. GRAPHIQUE AVEC MENU SÉLECTION ---
+st.header("📈 Courbes de Remplissage")
+p_selected = st.selectbox("Sélectionner un parking particulier :", ["Site Global"] + ORDRE)
 
-# Simulation des courbes
-h_axis = [f"{h}h" for h in range(6, 20)]
-base_data = [5, 25, 75, 98, 100, 100, 95, 70, 80, 95, 80, 50, 20, 5]
-p_reel = ((sum(CAPACITES.values()) - total_libres) / sum(CAPACITES.values())) * 100
-reel_curve = [v if h < now.hour else (p_reel if h == now.hour else None) for h, v in zip(range(6, 20), base_data)]
+# On simule la courbe Sytadin (Moyenne historique)
+h_axis = [f"{h}h" for h in range(6, 19)]
+base_curves = [5, 25, 75, 95, 100, 100, 95, 80, 85, 98, 90, 60, 30]
 
-st.line_chart(pd.DataFrame({"Historique": base_data, "Réel": reel_curve}, index=h_axis))
+# Calcul du point réel (en %)
+p_reel_total = ((sum(CAPACITES.values()) - total_libres) / sum(CAPACITES.values())) * 100
+reel_curve = [v if h < now.hour else (p_reel_total if h == now.hour else None) for h, v in zip(range(6, 19), base_curves)]
 
-# 3. TABLEAU TEMPS D'ATTENTE (HEURE PAR HEURE)
+st.line_chart(pd.DataFrame({'Historique': base_curves, 'Temps Réel': reel_curve}, index=h_axis))
+
+# --- 3. TABLEAU TEMPS D'ATTENTE (Heure par heure) ---
 st.header("⏳ Temps d'attente estimé (min)")
-# Création dynamique du tableau d'attente
-wait_profiles = {
-    "P2/P18/P19": [0, 45, 90, 120, 180, 180, 150, 120, 90, 60, 30],
-    "P5/P6/P4": [0, 15, 30, 45, 30, 20, 15, 20, 30, 20, 5]
-}
-
+# Matrice simplifiée selon le type de parking
 wait_rows = []
 for p in ORDRE:
-    profile = wait_profiles["P2/P18/P19"] if p in ['P2','P18','P19'] else wait_profiles["P5/P6/P4"]
+    # Profil 'lent' (P2, P18, P19) vs 'dynamique' (P5, P6)
+    wait_profile = [10, 40, 80, 120, 180, 180, 150, 100, 60, 40, 15] if p in ['P2','P18','P19'] else [5, 15, 30, 45, 30, 15, 10, 20, 25, 15, 5]
     row = {"Parking": p}
     for i, h in enumerate(range(7, 18)):
-        row[f"{h}h"] = profile[i]
+        row[f"{h}h"] = wait_profile[i]
     wait_rows.append(row)
 
 st.dataframe(pd.DataFrame(wait_rows).set_index("Parking"))
+
+st.info("💡 Astuce : Entre 12h15 et 12h45, le P6 a le turnover le plus élevé.")
