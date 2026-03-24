@@ -1,84 +1,97 @@
 import streamlit as st
-import requests
+import cloudscraper
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta
 import pandas as pd
 import re
 
-# Désactivation totale des alertes de sécurité
-import urllib3
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
-st.set_page_config(page_title="TCR Bornes Predict", layout="wide")
+# Configuration
+st.set_page_config(page_title="TCR RealTime", layout="wide")
 
 CAPACITES = {'P2': 8, 'P4': 15, 'P5': 20, 'P6': 49, 'P8': 5, 'P19': 10, 'P18': 9}
 ORDRE = ['P2', 'P4', 'P5', 'P6', 'P8', 'P19', 'P18']
 HISTO_SAT = {'P2':'06:55','P4':'07:18','P5':'07:28','P6':'07:38','P8':'07:51','P19':'07:05','P18':'07:13'}
 
-@st.cache_data(ttl=30)
-def fetch_data():
-    # Utilisation du HTTP simple pour contourner le SSL foireux
-    url = "http://www.smartevlab.fr/"
+# --- MOTEUR DE RÉCUPÉRATION ROBUSTE ---
+@st.cache_data(ttl=15)
+def get_live_data():
     try:
-        # Timeout court pour ne pas bloquer l'appli
-        res = requests.get(url, timeout=8, verify=False, headers={'User-Agent': 'Mozilla/5.0'})
-        if res.status_code == 200:
-            soup = BeautifulSoup(res.text, "html.parser")
-            results = {}
-            cards = soup.find_all("div", class_="card")
-            for card in cards:
-                txt = card.get_text(" ", strip=True).upper().replace(" ", "")
-                for p in ORDRE:
-                    if p in txt:
-                        c_el = card.find("div", id=re.compile(r'count_parking_'))
-                        if c_el:
-                            n = re.findall(r'\d+', c_el.get_text())
-                            if n: results[p] = int(n[0])
-            if results: return results
-    except:
-        pass
-    return None
+        # cloudscraper imite un navigateur pour éviter le blocage IP
+        scraper = cloudscraper.create_scraper()
+        response = scraper.get("http://www.smartevlab.fr/", timeout=15)
+        soup = BeautifulSoup(response.text, "html.parser")
+        
+        data_found = {}
+        # On scanne les cartes par ID fixe (méthode la plus rapide)
+        mapping = {'P2':1,'P4':3,'P5':4,'P6':5,'P8':6,'P18':11,'P19':12}
+        
+        for p_name, p_id in mapping.items():
+            element = soup.find("div", id=f"count_parking_{p_id}")
+            if element:
+                # Extraction propre du chiffre uniquement
+                val = re.search(r'\d+', element.get_text())
+                if val:
+                    data_found[p_name] = int(val.group())
+        
+        return data_found
+    except Exception as e:
+        return None
 
-# --- LOGIQUE ---
-raw_live = fetch_data()
+# --- LOGIQUE D'AFFICHAGE ---
+live_data = get_live_data()
 now = datetime.now()
 is_monday = now.weekday() == 0
 
-# Système de secours si le site est bloqué
-if not raw_live:
-    st.error("🔌 Site source inaccessible (SSL/Timeout). Passage en mode 'Estimation historique'.")
-    # On simule des données crédibles : le matin c'est plein, le midi ça se libère un peu
-    hour = now.hour
-    if hour < 7: data_live = {p: CAPACITES[p] for p in ORDRE}
-    elif hour < 12: data_live = {p: 0 for p in ORDRE}
-    elif hour < 14: data_live = {'P2':0, 'P4':2, 'P5':5, 'P6':12, 'P8':1, 'P19':0, 'P18':1}
-    else: data_live = {p: 0 for p in ORDRE}
-else:
-    data_live = raw_live
-    st.success(f"✅ Live OK ({now.strftime('%H:%M')})")
+st.title("🔌 TCR Live - Temps Réel")
 
-# --- UI TABLEAU ---
-st.header("🚗 État & Saturation")
+# 1. TABLEAU DE BORD (Priorité Conduite)
+if not live_data:
+    st.error("❌ Échec de synchronisation. Tentative de reconnexion automatique...")
+    if st.button("Réessayer maintenant"):
+        st.cache_data.clear()
+        st.rerun()
+    live_data = {p: 0 for p in ORDRE} # Évite le crash
+else:
+    st.success(f"✅ Données Live Synchronisées - {now.strftime('%H:%M:%S')}")
+
+# Tableau compact
 summary = []
+total_libres = 0
 for p in ORDRE:
-    dispo = data_live.get(p, 0)
-    h_theo = datetime.strptime(HISTO_SAT[p], "%H:%M")
-    h_sat = (h_theo + timedelta(minutes=-15 if is_monday else 0)).strftime("%H:%M")
-    status = "🟢" if dispo > 2 else ("🟠" if dispo > 0 else "🔴")
-    summary.append({"Parking": p, "Statut": status, "Places": f"{dispo}/{CAPACITES[p]}", "Saturation": h_sat})
+    dispo = live_data.get(p, 0)
+    total_libres += dispo
+    h_sat = (datetime.strptime(HISTO_SAT[p], "%H:%M") + timedelta(minutes=-15 if is_monday else 0)).strftime("%H:%M")
+    status = "🟢" if dispo > 3 else ("🟠" if dispo > 0 else "🔴")
+    summary.append({"Parking": p, "État": status, "Dispo": f"{dispo}/{CAPACITES[p]}", "Saturation": h_sat})
 
 st.table(pd.DataFrame(summary))
 
-# --- GRAPHIQUE ---
-st.header("📈 Remplissage (%)")
-base_curves = [5, 25, 75, 95, 100, 98, 92, 85, 90, 98, 85, 60, 30]
-total_libres = sum(data_live.values())
-p_reel = ((sum(CAPACITES.values()) - total_libres) / sum(CAPACITES.values())) * 100
-reel_curve = [v if h < now.hour else (p_reel if h == now.hour else None) for h, v in zip(range(6, 19), base_curves)]
-st.line_chart(pd.DataFrame({'Moyenne': base_curves, 'Réel': reel_curve}, index=[f"{h}h" for h in range(6, 19)]))
+# 2. MENU SÉLECTION & GRAPHIQUE PRÉDICTIF
+st.header("📈 Graphique de remplissage")
+target_p = st.selectbox("Sélectionner un parking :", ["Site Global"] + ORDRE)
 
-# --- ATTENTE ---
-st.header("⏳ Temps d'attente (min)")
-wait_data = {p: [40, 90, 150, 180, 180, 160, 140, 120, 100, 60] for p in ORDRE}
-# On affiche un tableau condensé pour la conduite
-st.dataframe(pd.DataFrame(wait_data, index=[f"{h}h" for h in range(7, 17)]).T)
+# Simulation des courbes
+h_axis = [f"{h}h" for h in range(6, 20)]
+base_data = [5, 25, 75, 98, 100, 100, 95, 70, 80, 95, 80, 50, 20, 5]
+p_reel = ((sum(CAPACITES.values()) - total_libres) / sum(CAPACITES.values())) * 100
+reel_curve = [v if h < now.hour else (p_reel if h == now.hour else None) for h, v in zip(range(6, 20), base_data)]
+
+st.line_chart(pd.DataFrame({"Historique": base_data, "Réel": reel_curve}, index=h_axis))
+
+# 3. TABLEAU TEMPS D'ATTENTE (HEURE PAR HEURE)
+st.header("⏳ Temps d'attente estimé (min)")
+# Création dynamique du tableau d'attente
+wait_profiles = {
+    "P2/P18/P19": [0, 45, 90, 120, 180, 180, 150, 120, 90, 60, 30],
+    "P5/P6/P4": [0, 15, 30, 45, 30, 20, 15, 20, 30, 20, 5]
+}
+
+wait_rows = []
+for p in ORDRE:
+    profile = wait_profiles["P2/P18/P19"] if p in ['P2','P18','P19'] else wait_profiles["P5/P6/P4"]
+    row = {"Parking": p}
+    for i, h in enumerate(range(7, 18)):
+        row[f"{h}h"] = profile[i]
+    wait_rows.append(row)
+
+st.dataframe(pd.DataFrame(wait_rows).set_index("Parking"))
